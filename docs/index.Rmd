@@ -1,0 +1,213 @@
+---
+title: "中国农险行业数据分析"
+date: "2023/4/10"
+output:
+  rmdformats::downcute:
+    code_folding: show
+    self_contained: true
+    thumbnails: false
+    lightbox: true
+    gallery: false
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, echo=FALSE)
+```
+
+# 数据清洗
+
+```{r}
+library(readxl)
+library(writexl) 
+library(dplyr)
+library(ggplot2)
+library(sf)
+```
+
+```{r warning=FALSE, message=FALSE, include=FALSE}
+Crop <- read_excel(path = "D:/ly/task/ChinaRe/Agro DB - 20230322.xlsx", sheet = "db")
+
+# 规则0：签单保费为0的数据不合格
+Crop$R0 <- ifelse(Crop$签单保费==0,
+                  formatC(0, digits = 2, width = 2, format = "d", flag = "0"),NA)
+
+# 规则1：产品代码或标的代码为空
+Crop$R1 <- ifelse(is.na(Crop$产品代码)|is.na(Crop$标的代码),
+                  formatC(1, digits = 2, width = 2, format = "d", flag = "0"),NA)
+
+# 规则2：已决赔款＞0且保险金额=0的赔案数据不合格
+Crop$R2 <- ifelse(Crop$已决赔款>0&Crop$保险金额==0,
+                  formatC(2, digits = 2, width = 2, format = "d", flag = "0"),NA)
+
+# 规则3：签单保费＞保险金额的赔案数据不合格
+Crop$R3 <- ifelse(Crop$签单保费>Crop$保险金额,
+                  formatC(3, digits = 2, width = 2, format = "d", flag = "0"),NA)
+
+# 规则4：已决赔款＞保险金额的赔案数据不合格
+Crop$R4 <- ifelse(Crop$已决赔款>Crop$保险金额,
+                  formatC(4, digits = 2, width = 2, format = "d", flag = "0"),NA)
+
+# 规则5：受益户次＞承保户次的赔案数据不合格
+Crop$R5 <- ifelse(Crop$受益户次>Crop$承保户次,
+                  formatC(5, digits = 2, width = 2, format = "d", flag = "0"),NA)
+
+# 规则6：筛查重复项，跨年份的赔案
+Crop <- Crop %>% group_by_all() %>%
+  mutate(R6 = ifelse(row_number()>1,formatC(6, digits = 2, width = 2, format = "d", flag = "0"),NA)) %>%
+  as.data.frame()
+
+# # 规则7（待定）：承保数量＜已决数量的赔案不合格
+# Crop$R7 <- ifelse(Crop$承保数量<Crop$已决数量,7,"")
+
+Crop$ALLR <- sapply(X = 1:nrow(Crop), FUN = function(X) {
+  tag <- unlist(Crop[X,c("R0","R1","R2","R3","R4","R5","R6")])
+  flag <- is.na(tag)
+  if(sum(flag)==7)
+    return(NA)
+  else
+    return(paste0(tag[!flag], collapse="-"))
+})
+
+# 规范险种名
+Crop$Class[which(Crop$Class=="Crop")] <- "种植险"
+Crop$Class[which(Crop$Class=="Livestock")] <- "养殖险"
+Crop$Class[which(Crop$Class=="Forestry")] <- "森林险"
+
+# 规范省名称
+china_pro <- st_read("D:/ly/task/ChinaRe/CHINA.json")
+pro.name <- na.omit(china_pro$name)
+crop.pro.name <- Crop$省名称[!duplicated(Crop$省名称)]
+for(i in 1:length(crop.pro.name)) {
+  ix <- which((substring(pro.name,1,2)==substring(crop.pro.name[i],1,2)))
+  Crop[which(Crop$省名称==crop.pro.name[i]), "省名称"] <- pro.name[ix]
+}
+
+
+# write_xlsx(Crop, paste0(file_path, "标签-Agro DB.xlsx"))
+```
+
+# 数据分析及可视化
+
+## 国内农业保险业务规模发展概况
+
+```{r warning=FALSE, message=FALSE}
+# 计算复合增速
+Rate <- Crop %>%
+  group_by(UY,进展期) %>%
+  summarise(保费=sum(签单保费))
+Rate <- data.frame(Rate)
+Rate$UY <- as.numeric(Rate$UY)
+sort.UY <- sort(Rate$UY[!duplicated(Rate$UY)])
+for(UY in sort.UY[-1]) {
+  for(i in 1:nrow(Rate)) {
+    if(Rate$UY[i]!=UY)
+      next
+    ind <- which(Rate$UY==UY-1 & Rate$进展期==Rate[i,"进展期"])
+    Rate[i,"增速"] <- Rate[i,"保费"] / Rate[ind,"保费"]-1
+  }
+}
+
+Rate <- Rate %>%
+  group_by(UY) %>%
+  slice(which.max(进展期))
+
+# 区分种植、养殖、森林三类的图
+Crop2.1 <- Crop %>%
+  group_by(UY, 进展期, Class) %>%
+  summarize(保费=sum(签单保费))
+
+Crop2.1 <- Crop2.1 %>%
+  group_by(UY, Class) %>%
+  slice(which.max(进展期))
+
+Crop2.1 <- merge(Crop2.1, Rate[,c("UY","增速")], by="UY")
+
+ggplot(Crop2.1, aes(x = UY, y = 保费/1e8, fill = Class)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.6) +
+  geom_line(aes(y = 增速*100*20), color="SteelBlue", size = 1.2, linetype = "dashed") +
+  geom_text(aes(label = formatC(增速*100, digits=2, format="f"), x = UY, y = 增速*100*20), colour="black")+
+  labs(title = "农险行业保费结构及增速", x = "年份", y = "保费(亿)", fill = "险种") +
+  scale_y_continuous(breaks = seq(-3e2, 6e2, length.out=10),
+                     sec.axis = sec_axis(~./20, name = "保费复合增速(%)")) +
+  scale_x_continuous(breaks = sort.UY) +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme_bw()
+
+# 区分种森、养殖两类的图
+Crop.copy <- Crop
+Crop.copy$Class[which(Crop.copy$Class=="种植险" | Crop.copy$Class=="森林险")] <- "种植&森林险"
+
+Crop2.1 <- Crop.copy %>%
+  group_by(UY, 进展期, Class) %>%
+  summarize(保费=sum(签单保费))
+
+Crop2.1 <- Crop2.1 %>%
+  group_by(UY, Class) %>%
+  slice(which.max(进展期))
+
+Crop2.1 <- merge(Crop2.1, Rate[,c("UY","增速")], by="UY")
+
+ggplot(Crop2.1, aes(x = UY, y = 保费/1e8, fill = Class)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.6) +
+  geom_line(aes(y = 增速*100*20), color="SteelBlue", size = 1.2, linetype = "dashed") +
+  geom_text(aes(label = formatC(增速*100, digits=2, format="f"), x = UY, y = 增速*100*20), colour="black")+
+  labs(title = "农险行业保费结构及增速", x = "年份", y = "保费(亿)", fill = "险种") +
+  scale_y_continuous(breaks = seq(-3e2, 6e2, length.out=10),
+                     sec.axis = sec_axis(~./20, name = "保费复合增速(%)")) +
+  scale_x_continuous(breaks = sort.UY) +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme_bw()
+
+# 种森险&养殖险保费增速对比
+Rate <- Crop.copy %>%
+  group_by(UY,进展期,Class) %>%
+  summarise(保费=sum(签单保费))
+Rate <- data.frame(Rate)
+Rate$UY <- as.numeric(Rate$UY)
+sort.UY <- sort(Rate$UY[!duplicated(Rate$UY)])
+for(UY in sort.UY[-1]) {
+  for(i in 1:nrow(Rate)) {
+    if(Rate$UY[i]!=UY)
+      next
+    ind <- which(Rate$UY==UY-1 & Rate$进展期==Rate[i,"进展期"] & Rate$Class==Rate[i,"Class"])
+    Rate[i,"增速"] <- Rate[i,"保费"] / Rate[ind,"保费"]-1
+  }
+}
+
+Rate <- Rate %>%
+  group_by(UY,Class) %>%
+  slice(which.max(进展期))
+
+ggplot(Rate, aes(x = UY, y = 增速*100, fill = Class)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.5) +
+  geom_text(aes(label = formatC(增速*100, digits=2, format="f")),
+            position = position_dodge(width = 0.6), vjust = -0.5) +
+  coord_flip() +
+  labs(title = "种森险、养殖险保费增速对比", x = "年份", y = "保费增速(%)", fill = "险种") +
+  scale_x_continuous(breaks = sort.UY) +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme_bw()
+
+```
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
